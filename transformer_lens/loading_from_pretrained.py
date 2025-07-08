@@ -44,6 +44,7 @@ from transformer_lens.pretrained.weight_conversions import (
     convert_qwen3_weights,
     convert_qwen_weights,
     convert_t5_weights,
+    convert_granite_weights
 )
 
 OFFICIAL_MODEL_NAMES = [
@@ -263,6 +264,7 @@ OFFICIAL_MODEL_NAMES = [
     "google-t5/t5-base",
     "google-t5/t5-large",
     "ai-forever/mGPT",
+    "ibm-granite/granite-3.3-2b-instruct"
 ]
 """Official model names for models on HuggingFace."""
 
@@ -719,6 +721,7 @@ MODEL_ALIASES = {
     "google-t5/t5-base": ["t5-base"],
     "google-t5/t5-large": ["t5-large"],
     "ai-forever/mGPT": ["mGPT"],
+    "ibm-granite/granite-3.3-2b-instruct":["granite-3.3-2b","granite-3.3"]
 }
 """Model aliases for models on HuggingFace."""
 
@@ -794,6 +797,8 @@ def convert_hf_model_config(model_name: str, **kwargs: Any):
         architecture = "Gemma2ForCausalLM"
     elif "gemma" in official_model_name.lower():
         architecture = "GemmaForCausalLM"
+    # elif "granite" in official_model_name.lower():
+    #     architecture="GraniteForCausalLM"
     else:
         huggingface_token = os.environ.get("HF_TOKEN", "")
         hf_config = AutoConfig.from_pretrained(
@@ -1436,7 +1441,44 @@ def convert_hf_model_config(model_name: str, **kwargs: Any):
             "parallel_attn_mlp": False,
             "rotary_dim": hf_config.hidden_size // hf_config.num_attention_heads,
         }
-
+    # elif architecture=="GraniteForCausalLM":
+    #     ### Architecture for Granite 3.3 2b and Granite 3.3 2b instruct models
+    #       cfg_dict = {
+    #     "d_model": 2048,
+    #     "d_head": 64,
+    #     "n_heads": 32,
+    #     "d_mlp": 8192,
+    #     "n_layers": 40,
+    #     "n_ctx": 2048,
+    #     "eps": 1e-5,
+    #     "d_vocab": 49152,
+    #     "act_fn": "swiglu", # Based on common practice for Granite-like models
+    #     "normalization_type": "RMS",
+    #     "positional_embedding_type": "rotary",
+    #     "gated_mlp":True,
+    #     "rotary_dim": 64,
+    #     "final_rms":True
+    # }
+    elif architecture == "GraniteForCausalLM":
+        # This block now correctly assumes `hf_config` has been loaded
+        cfg_dict = {
+            "d_model": hf_config.hidden_size,
+            "n_layers": hf_config.num_hidden_layers,
+            "n_heads": hf_config.num_attention_heads,
+            "d_head": hf_config.hidden_size // hf_config.num_attention_heads,
+            "d_mlp": hf_config.intermediate_size,
+            "n_ctx": hf_config.max_position_embeddings,
+            "eps": hf_config.rms_norm_eps,
+            "d_vocab": hf_config.vocab_size,
+            "act_fn": "swiglu",
+            "normalization_type": "RMS",
+            "positional_embedding_type": "rotary",
+            "n_key_value_heads": hf_config.num_key_value_heads,
+            "gated_mlp": True,
+            "final_rms": True,
+            # rotary_dim is often d_head
+            "rotary_dim": hf_config.hidden_size // hf_config.num_attention_heads,
+        }
     elif official_model_name.startswith("google/gemma-2b"):
         # Architecture for Gemma 2b and Gemma 2b Instruct models
         cfg_dict = {
@@ -1986,6 +2028,9 @@ def get_pretrained_state_dict(
             state_dict = convert_gemma_weights(hf_model, cfg)
         elif cfg.original_architecture == "Gemma2ForCausalLM":
             state_dict = convert_gemma_weights(hf_model, cfg)
+        elif cfg.original_architecture=="GraniteForCausalLM":
+            state_dict=convert_granite_weights(hf_model,cfg)
+            
         else:
             raise ValueError(
                 f"Loading weights from the architecture is not currently supported: {cfg.original_architecture}, generated from model name {cfg.model_name}. Feel free to open an issue on GitHub to request this feature."

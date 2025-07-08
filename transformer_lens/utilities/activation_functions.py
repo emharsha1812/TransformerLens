@@ -23,4 +23,5 @@ SUPPORTED_ACTIVATIONS: Dict[str, ActivationFunction] = {
     "relu": F.relu,
     "gelu": F.gelu,
     "gelu_pytorch_tanh": lambda tensor: F.gelu(tensor, approximate="tanh"),
+    "swiglu": lambda x: F.silu(torch.chunk(x, 2, dim=-1)[0]) * torch.chunk(x, 2, dim=-1)[1],
 }
