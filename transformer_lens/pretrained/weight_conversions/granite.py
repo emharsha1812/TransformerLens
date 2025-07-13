@@ -1,70 +1,82 @@
-# In transformer_lens/pretrained/weight_conversions/granite.py
-
 from typing import cast
 import einops
 import torch
-from transformers import GraniteForCausalLM
 from transformer_lens.HookedTransformerConfig import HookedTransformerConfig
 
-def convert_granite_weights(
-    hf_model: GraniteForCausalLM, cfg: HookedTransformerConfig
-) -> dict[str, torch.Tensor]:
+
+def convert_granite_weights(hf_model, cfg: HookedTransformerConfig):
     """
     Converts the weights of a Hugging Face GraniteForCausalLM model to the format
-    used by HookedTransformer, correctly handling Grouped-Query Attention (GQA)
-    and weight transpositions.
+    used by HookedTransformer
     """
     state_dict = {}
 
-    # Token Embeddings
-    state_dict["embed.W_E"] = hf_model.model.embed_tokens.weight
+    # Token Embeddings - move to the correct device
+    state_dict["embed.W_E"] = hf_model.model.embed_tokens.weight.to(device=cfg.device)
 
-    # Safely get the number of key-value heads for GQA
-    # This is the number of heads for the Key and Value projections
-    n_kv_heads = cast(int, cfg.n_key_value_heads)
+    # Granite architecture use Grouped Query Attention
+    using_gqa = cfg.n_key_value_heads is not None
+    gqa_uscore = "_" if using_gqa else ""
+    n_kv_heads = cast(int, cfg.n_key_value_heads if using_gqa else cfg.n_heads)
 
     for l in range(cfg.n_layers):
-        # LayerNorm 1 (before attention)
-        state_dict[f"blocks.{l}.ln1.w"] = hf_model.model.layers[l].input_layernorm.weight
+        # LayerNorm 1 - move to the correct device
+        state_dict[f"blocks.{l}.ln1.w"] = hf_model.model.layers[l].input_layernorm.weight.to(device=cfg.device)
 
         # Attention weights
-        W_Q = hf_model.model.layers[l].self_attn.q_proj.weight
-        W_K = hf_model.model.layers[l].self_attn.k_proj.weight
-        W_V = hf_model.model.layers[l].self_attn.v_proj.weight
-        W_O = hf_model.model.layers[l].self_attn.o_proj.weight
+        # Transpose the weights first, then rearrange
+        W_Q = hf_model.model.layers[l].self_attn.q_proj.weight.T
+        W_K = hf_model.model.layers[l].self_attn.k_proj.weight.T
+        W_V = hf_model.model.layers[l].self_attn.v_proj.weight.T
+        W_O = hf_model.model.layers[l].self_attn.o_proj.weight.T
 
-        # Reshape weights for TransformerLens internal format.
+        # Reshape weights for TransformerLens internal format
+        W_Q = einops.rearrange(W_Q, "m (n h) -> n m h", n=cfg.n_heads)
+        W_K = einops.rearrange(W_K, "m (n h) -> n m h", n=n_kv_heads)
+        W_V = einops.rearrange(W_V, "m (n h) -> n m h", n=n_kv_heads)
+        W_O = einops.rearrange(W_O, "(n h) m -> n h m", n=cfg.n_heads)
+
+        # Move weights to the correct device
+        state_dict[f"blocks.{l}.attn.W_Q"] = W_Q.to(device=cfg.device)
+        state_dict[f"blocks.{l}.attn.{gqa_uscore}W_K"] = W_K.to(device=cfg.device)
+        state_dict[f"blocks.{l}.attn.{gqa_uscore}W_V"] = W_V.to(device=cfg.device)
+        state_dict[f"blocks.{l}.attn.W_O"] = W_O.to(device=cfg.device)
         
-        # W_Q uses the main number of heads (n_heads)
-        state_dict[f"blocks.{l}.attn.W_Q"] = einops.rearrange(
-            W_Q, "(n h) m -> n m h", n=cfg.n_heads, h=cfg.d_head
+        # Attention biases (Granite models don't use biases, so we set them to zero)
+        state_dict[f"blocks.{l}.attn.b_Q"] = torch.zeros(
+            cfg.n_heads, cfg.d_head, dtype=cfg.dtype, device=cfg.device
         )
-        
-        # W_K and W_V use the smaller number of heads for GQA (n_kv_heads)
-        # This is the line that fixes the bug.
-        state_dict[f"blocks.{l}.attn.W_K"] = einops.rearrange(
-            W_K, "(n h) m -> n m h", n=n_kv_heads, h=cfg.d_head
+        state_dict[f"blocks.{l}.attn.{gqa_uscore}b_K"] = torch.zeros(
+            n_kv_heads, cfg.d_head, dtype=cfg.dtype, device=cfg.device
         )
-        state_dict[f"blocks.{l}.attn.W_V"] = einops.rearrange(
-            W_V, "(n h) m -> n m h", n=n_kv_heads, h=cfg.d_head
+        state_dict[f"blocks.{l}.attn.{gqa_uscore}b_V"] = torch.zeros(
+            n_kv_heads, cfg.d_head, dtype=cfg.dtype, device=cfg.device
         )
-        
-        state_dict[f"blocks.{l}.attn.W_O"] = einops.rearrange(
-            W_O, "m (n h) -> n h m", n=cfg.n_heads, h=cfg.d_head
+        state_dict[f"blocks.{l}.attn.b_O"] = torch.zeros(
+            cfg.d_model, dtype=cfg.dtype, device=cfg.device
         )
 
-        # LayerNorm 2 (before MLP)
-        state_dict[f"blocks.{l}.ln2.w"] = hf_model.model.layers[l].post_attention_layernorm.weight
+        # LayerNorm 2 
+        state_dict[f"blocks.{l}.ln2.w"] = hf_model.model.layers[l].post_attention_layernorm.weight.to(device=cfg.device)
 
-        # MLP weights (transpose is necessary)
-        state_dict[f"blocks.{l}.mlp.W_gate"] = hf_model.model.layers[l].mlp.gate_proj.weight.T
-        state_dict[f"blocks.{l}.mlp.W_in"] = hf_model.model.layers[l].mlp.up_proj.weight.T
-        state_dict[f"blocks.{l}.mlp.W_out"] = hf_model.model.layers[l].mlp.down_proj.weight.T
+        # MLP weights for GatedMLP - move to the correct device
+        state_dict[f"blocks.{l}.mlp.W_in"] = hf_model.model.layers[l].mlp.up_proj.weight.T.to(device=cfg.device)
+        state_dict[f"blocks.{l}.mlp.W_gate"] = hf_model.model.layers[l].mlp.gate_proj.weight.T.to(device=cfg.device)
+        state_dict[f"blocks.{l}.mlp.W_out"] = hf_model.model.layers[l].mlp.down_proj.weight.T.to(device=cfg.device)
 
-    # Final LayerNorm
-    state_dict["ln_final.w"] = hf_model.model.norm.weight
+        # MLP biases (Granite models don't use biases, so we set them to zero)
+        state_dict[f"blocks.{l}.mlp.b_in"] = torch.zeros(
+            cfg.d_mlp, dtype=cfg.dtype, device=cfg.device
+        )
+        state_dict[f"blocks.{l}.mlp.b_out"] = torch.zeros(
+            cfg.d_model, dtype=cfg.dtype, device=cfg.device
+        )
+
+    # Final LayerNorm 
+    state_dict["ln_final.w"] = hf_model.model.norm.weight.to(device=cfg.device)
     
-    # Unembedding weights (transpose is necessary)
-    state_dict["unembed.W_U"] = hf_model.lm_head.weight.T
+    # Unembedding weights
+    state_dict["unembed.W_U"] = hf_model.lm_head.weight.T.to(device=cfg.device)
+    state_dict["unembed.b_U"] = torch.zeros(cfg.d_vocab, dtype=cfg.dtype, device=cfg.device)
 
     return state_dict
